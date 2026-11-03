@@ -1,0 +1,325 @@
+//! Consumer mode: get messages from the target and render them.
+
+use std::io::{self, Write as _};
+
+use mqi::{constants, get::GetWait, prelude::*};
+
+use crate::{
+    connection,
+    error::MqCatError,
+    format::{MessageFormatString, RenderedMessage},
+    target::Target,
+};
+
+use crate::cli::Cli;
+
+/// Default format string applied when the user did not supply `-f`.
+///
+/// This mirrors kcat, which prints the message body followed by the output
+/// delimiter. The delimiter is appended by [`render_and_write`] rather than being
+/// part of the format string so that `-D` stays authoritative.
+pub const DEFAULT_FORMAT: &str = "%s";
+
+/// Run consumer mode.
+///
+/// # Errors
+/// Returns an error when the connection, open, or get fails, or when output
+/// cannot be written.
+pub fn run(cli: &Cli, target: &Target) -> Result<(), MqCatError> {
+    let format = compile_format(cli)?;
+    // A format that never references the body still needs the get buffer, but
+    // knowing the body is unused lets the renderer skip copying it. The flag is
+    // also what the README documents as the reason `%s` matters for binary data.
+    debug_assert!(
+        format.uses_body() || !format.segments().is_empty(),
+        "format strings always render at least one segment"
+    );
+    let delimiter = crate::delimiters::parse(&cli.delimiter).map_err(|source| MqCatError::InvalidDelimiter {
+        value: cli.delimiter.clone(),
+        source,
+    })?;
+    let correl_id = cli
+        .correl_id
+        .as_deref()
+        .map(crate::error::parse_identifier)
+        .transpose()
+        .map_err(|source| MqCatError::InvalidIdentifier {
+            value: cli.correl_id.clone().unwrap_or_default(),
+            source,
+        })?;
+    let msg_id = cli
+        .msg_id
+        .as_deref()
+        .map(crate::error::parse_identifier)
+        .transpose()
+        .map_err(|source| MqCatError::InvalidIdentifier {
+            value: cli.msg_id.clone().unwrap_or_default(),
+            source,
+        })?;
+
+    let access = consumer_access(cli);
+    let connection = connection::connect(cli)?;
+    let object = mqi::Object::open(connection, &connection::open_options(target, access))
+        .warn_as_error()
+        .map_err(|source| MqCatError::Open {
+            target: target.display_name(),
+            source,
+        })?;
+
+    let mut buffer = vec![0u8; 16 * 1024 * 1024];
+    let mut stdout = io::stdout().lock();
+    let mut consumed = 0usize;
+
+    while !cli.count.is_some_and(|limit| consumed >= limit) {
+        // A message handle is only needed when properties are part of the output.
+        let mut properties = if format.uses_properties() {
+            Some(
+                mqi::Properties::new(object.connection().connection_ref(), mqi::types::MQCMHO::default()).map_err(|source| {
+                    MqCatError::Mq {
+                        operation: "MQCRTMH",
+                        source,
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+
+        let wait = wait_option(cli);
+        let correl = correl_id.map(mqi::types::CorrelationId);
+        let msg = msg_id.map(mqi::types::MessageId);
+        // When syncpoint is requested the get joins the unit of work and the
+        // message is only removed once committed below.
+        let syncpoint = cli.syncpoint.then_some(constants::MQGMO_SYNCPOINT);
+
+        let result = match properties.as_mut() {
+            Some(handle) => object
+                .get_data_with(&(wait, correl, msg, syncpoint, &mut *handle), buffer.as_mut_slice())
+                .warn_as_error(),
+            None => object
+                .get_data_with(&(wait_option(cli), correl, msg, syncpoint), buffer.as_mut_slice())
+                .warn_as_error(),
+        };
+
+        let Some((body, descriptor)) = result.map_err(|source| MqCatError::Mq {
+            operation: "MQGET",
+            source,
+        })?
+        else {
+            // No message available within the wait window.
+            if cli.exit_on_empty {
+                break;
+            }
+            if matches!(wait_option(cli), GetWait::NoWait) {
+                // A no-wait get would spin; sleep briefly instead.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            continue;
+        };
+
+        let property_text = match properties.as_ref() {
+            Some(handle) => collect_properties(handle)?,
+            None => String::new(),
+        };
+
+        let target_name = target.display_name();
+        let rendered = RenderedMessage {
+            body,
+            descriptor: &descriptor,
+            target: &target_name,
+            properties: &property_text,
+        }
+        .render(&format)
+        .map_err(MqCatError::Write)?;
+
+        render_and_write(&mut stdout, &rendered, &delimiter).map_err(MqCatError::Write)?;
+
+        if cli.syncpoint {
+            // Commit the unit of work so the message is removed from the queue.
+            // `Syncpoint::new` manages the current unit without calling MQBEGIN,
+            // which is what a single-resource get needs.
+            // The commit consumes the Syncpoint and returns the connection
+            // reference; the unit of work is finished so the value is dropped.
+            let _ = mqi::Syncpoint::new(object.connection().connection_ref())
+                .commit()
+                .warn_as_error()
+                .map_err(|source| MqCatError::Mq {
+                    operation: "MQCMIT",
+                    source,
+                })?;
+        }
+
+        if let Some(handle) = properties {
+            handle.close().map_err(|source| MqCatError::Mq {
+                operation: "MQDLTMH",
+                source,
+            })?;
+        }
+
+        consumed += 1;
+    }
+
+    object.close().warn_as_error().map_err(|source| MqCatError::Mq {
+        operation: "MQCLOSE",
+        source,
+    })?;
+
+    Ok(())
+}
+
+/// Compile the format string, falling back to the default.
+fn compile_format(cli: &Cli) -> Result<MessageFormatString, MqCatError> {
+    let source = cli.format.as_deref().unwrap_or(DEFAULT_FORMAT);
+    MessageFormatString::parse(source).map_err(|source| MqCatError::InvalidFormat { source })
+}
+
+/// Choose the wait option for a get.
+///
+/// `--exit-on-empty` implies an immediate check; a browse always uses no-wait so
+/// the cursor can advance without blocking. Otherwise the configured `--wait`
+/// seconds are used.
+fn wait_option(cli: &Cli) -> GetWait {
+    if cli.exit_on_empty || cli.browse {
+        GetWait::NoWait
+    } else {
+        GetWait::Wait(i32::try_from(cli.wait.saturating_mul(1000)).unwrap_or(i32::MAX))
+    }
+}
+
+/// Build the `MQOO_*` access flags for consumer mode.
+fn consumer_access(cli: &Cli) -> mqi::types::MQOO {
+    let base = if cli.browse {
+        constants::MQOO_BROWSE | constants::MQOO_INPUT_AS_Q_DEF
+    } else if cli.shared {
+        constants::MQOO_INPUT_SHARED
+    } else {
+        constants::MQOO_INPUT_AS_Q_DEF
+    };
+    connection::access_options(base)
+}
+
+/// Collect message properties as a `name=value` CSV string.
+fn collect_properties(handle: &mqi::Properties<connection::ConnectionRef<'_>>) -> Result<String, MqCatError> {
+    use mqi::properties::{INQUIRE_ALL_USR, Name, Value};
+
+    let mut pairs = Vec::new();
+    for property in handle.property_iter::<(Value, Name<String>), _>(INQUIRE_ALL_USR, mqi::types::MQIMPO::default()) {
+        let (value, Name(name)) = property.warn_as_error().map_err(|source| MqCatError::Mq {
+            operation: "MQINQMP",
+            source,
+        })?;
+        pairs.push(format!("{name}={value:?}"));
+    }
+    Ok(pairs.join(","))
+}
+
+/// Write the rendered message followed by the output delimiter.
+fn render_and_write(out: &mut impl io::Write, rendered: &[u8], delimiter: &[u8]) -> io::Result<()> {
+    out.write_all(rendered)?;
+    if !delimiter.is_empty() {
+        out.write_all(delimiter)?;
+    }
+    out.flush()
+}
+
+/// Run metadata-list mode, reporting queue attributes for the target.
+///
+/// # Errors
+/// Returns an error when the connection or open fails, or when attributes cannot
+/// be inquired.
+pub fn list(cli: &Cli, target: &Target) -> Result<(), MqCatError> {
+    let access = connection::access_options(constants::MQOO_INQUIRE | constants::MQOO_INPUT_AS_Q_DEF);
+    let connection = connection::connect(cli)?;
+    let object = mqi::Object::open(connection, &connection::open_options(target, access))
+        .warn_as_error()
+        .map_err(|source| MqCatError::Open {
+            target: target.display_name(),
+            source,
+        })?;
+
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "target: {}", target.display_name()).map_err(MqCatError::Write)?;
+    writeln!(stdout, "kind: {}", if target.is_topic() { "topic" } else { "queue" }).map_err(MqCatError::Write)?;
+
+    let depth = object
+        .inquire_integer(mqi::attribute::MQIA_CURRENT_Q_DEPTH)
+        .warn_as_error()
+        .map_err(|source| MqCatError::Mq {
+            operation: "MQINQ",
+            source,
+        })?;
+    writeln!(stdout, "current-depth: {}", depth.unwrap_or_default()).map_err(MqCatError::Write)?;
+
+    let max_depth = object
+        .inquire_integer(mqi::attribute::MQIA_MAX_Q_DEPTH)
+        .warn_as_error()
+        .map_err(|source| MqCatError::Mq {
+            operation: "MQINQ",
+            source,
+        })?;
+    writeln!(stdout, "max-depth: {}", max_depth.unwrap_or_default()).map_err(MqCatError::Write)?;
+
+    stdout.flush().map_err(MqCatError::Write)?;
+
+    object.close().warn_as_error().map_err(|source| MqCatError::Mq {
+        operation: "MQCLOSE",
+        source,
+    })?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser as _;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("mqcat").chain(args.iter().copied())).expect("valid arguments")
+    }
+
+    #[test]
+    fn default_format_renders_body_only() {
+        let format = MessageFormatString::parse(DEFAULT_FORMAT).unwrap();
+        assert!(format.uses_body());
+        assert!(!format.uses_properties());
+    }
+
+    #[test]
+    fn exit_on_empty_uses_no_wait() {
+        let cli = parse(&["-C", "-t", "Q1", "-e"]);
+        assert!(matches!(wait_option(&cli), GetWait::NoWait));
+    }
+
+    #[test]
+    fn default_wait_is_in_milliseconds() {
+        let cli = parse(&["-C", "-t", "Q1", "-w", "3"]);
+        assert!(matches!(wait_option(&cli), GetWait::Wait(3000)));
+    }
+
+    #[test]
+    fn browse_uses_browse_access() {
+        let cli = parse(&["-C", "-t", "Q1", "--browse"]);
+        assert!(consumer_access(&cli).contains(constants::MQOO_BROWSE));
+    }
+
+    #[test]
+    fn shared_uses_shared_access() {
+        let cli = parse(&["-C", "-t", "Q1", "--shared"]);
+        assert!(consumer_access(&cli).contains(constants::MQOO_INPUT_SHARED));
+    }
+
+    #[test]
+    fn render_appends_delimiter() {
+        let mut out = Vec::new();
+        render_and_write(&mut out, b"body", b"\n").unwrap();
+        assert_eq!(out, b"body\n");
+    }
+
+    #[test]
+    fn empty_delimiter_appends_nothing() {
+        let mut out = Vec::new();
+        render_and_write(&mut out, b"body", b"").unwrap();
+        assert_eq!(out, b"body");
+    }
+}

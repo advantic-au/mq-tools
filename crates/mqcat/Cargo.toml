@@ -1,0 +1,18 @@
+[package]
+name = "mqcat"
+description = "kcat-style command-line producer and consumer for IBM MQ"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mqcat"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+dlopen2.workspace = true
+libmqm-sys.workspace = true
+mqi.workspace = true
+thiserror.workspace = true

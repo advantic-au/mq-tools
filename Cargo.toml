@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/mqcat"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# IBM MQ interface. The `link` default feature would bind the MQ client into the
+# binary at build time, so default features are disabled and `dlopen2` enabled
+# instead: the client library is opened at run time and only needs to be
+# installed wherever the binary runs, not wherever it is built.
+mqi = { version = "0.4", default-features = false }
+# Underlying FFI crate. mqi re-exports most types, but the runtime library
+# handle (`libmqm_sys::dlopen2::MqmContainer`) and its loading trait are only
+# reachable through this crate directly. `link` must be off here too, because
+# mqi's own default features enable it.
+libmqm-sys = { version = "0.11", default-features = false, features = ["dlopen2"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+thiserror = "2"
+# Surfaces dynamic-loader failures when opening the MQ client library at run time.
+dlopen2 = "0.9"
