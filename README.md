@@ -67,26 +67,5 @@ mqcat -C --browse -t DEV.QUEUE.1 -b "$MQ_SERVER" -m QM1 -u app -a password
 mqcat -L -t DEV.QUEUE.1 -b "$MQ_SERVER" -m QM1 -u app -a password
 ```
 
-### Queue manager prerequisites
-
-`mqcat` needs no special queue manager configuration beyond a working channel
-and a user that may connect. Two settings are worth knowing about:
-
-* **`MQOO_INQUIRE` is required.** The consumer sizes its get buffer from the
-  queue's `MAXMSGL`, so the user needs inquire authority on the queue. Without
-  it, MQGET fails with `MQRC_DATA_LENGTH_ERROR`.
-* **Connection authentication.** If the queue manager uses `CONNAUTH` with
-  `CHCKCLNT(REQUIRED)`, the supplied user and password are validated by the
-  host's PAM stack. Minimal container images often ship without PAM modules or
-  an `app` OS user, in which case authentication cannot succeed and the
-  connection is refused with `MQRC_NOT_AUTHORIZED` or `MQRC_SECURITY_ERROR`.
-  Either install PAM and create the user, or relax the check for development:
-
-  ```bash
-  # Development only: accept the supplied user without validating the password
-  echo "ALTER AUTHINFO(DEV.AUTHINFO) AUTHTYPE(IDPWOS) CHCKCLNT(NONE) ADOPTCTX(YES)" | runmqsc QM1
-  echo "SET CHLAUTH(DEV.APP.SVRCONN) TYPE(ADDRESSMAP) ADDRESS(*) USERSRC(CHANNEL) CHCKCLNT(ASQMGR) ACTION(REPLACE)" | runmqsc QM1
-  ```
-
 See [`crates/mqcat/README.md`](crates/mqcat/README.md) for the full option
 reference and the format-string tokens.

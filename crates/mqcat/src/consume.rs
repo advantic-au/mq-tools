@@ -20,6 +20,13 @@ use crate::cli::Cli;
 /// part of the format string so that `-D` stays authoritative.
 pub const DEFAULT_FORMAT: &str = "%s";
 
+/// Get buffer size used when the queue's maximum message length is unknown.
+///
+/// This applies when the queue manager refuses an inquiring open, or when the
+/// object reports no limit (as topics do). One mebibyte matches the default
+/// `MAXMSGL` of a queue created without an explicit limit.
+pub const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
+
 /// Run consumer mode.
 ///
 /// # Errors
@@ -57,26 +64,38 @@ pub fn run(cli: &Cli, target: &Target) -> Result<(), MqCatError> {
             source,
         })?;
 
-    let access = consumer_access(cli);
     let connection = connection::connect(cli)?;
-    let object = mqi::Object::open(connection, &connection::open_options(target, access))
-        .warn_as_error()
-        .map_err(|source| MqCatError::Open {
-            target: target.display_name(),
-            source,
-        })?;
 
-    // MQ rejects an MQGET whose buffer length exceeds the object's maximum
-    // message length with MQRC_DATA_LENGTH_ERROR, so size the buffer from the
-    // queue's own limit instead of guessing. Topics report no limit, so fall
-    // back to a generous default there.
-    let max_message_length = object
-        .inquire_integer(mqi::attribute::MQIA_MAX_MSG_LENGTH)
-        .warn_as_error()
-        .ok()
-        .flatten()
-        .filter(|len| *len > 0)
-        .map_or(16 * 1024 * 1024, |len| len as usize);
+    // Prefer an open that permits inquiry: the get buffer is then sized from the
+    // queue's own maximum message length, which avoids both truncation and the
+    // MQRC_DATA_LENGTH_ERROR MQ returns when the buffer exceeds that limit.
+    // Inquire authority is not always granted, so fall back to a plain input
+    // open and a fixed default buffer when the first attempt is refused.
+    let (object, max_message_length) = match open_with_inquire(cli, target, connection.connection_ref()) {
+        Ok(object) => {
+            let limit = object
+                .inquire_integer(mqi::attribute::MQIA_MAX_MSG_LENGTH)
+                .warn_as_error()
+                .ok()
+                .flatten()
+                .filter(|len| *len > 0)
+                .map_or(DEFAULT_BUFFER_SIZE, |len| len as usize);
+            (object, limit)
+        }
+        Err(_) => {
+            let object = mqi::Object::open(
+                connection.connection_ref(),
+                &connection::open_options(target, consumer_access(cli, false)),
+            )
+            .warn_as_error()
+            .map_err(|source| MqCatError::Open {
+                target: target.display_name(),
+                source,
+            })?;
+            (object, DEFAULT_BUFFER_SIZE)
+        }
+    };
+
     let mut buffer = vec![0u8; max_message_length];
     let mut stdout = io::stdout().lock();
     let mut consumed = 0usize;
@@ -208,9 +227,10 @@ fn wait_option(cli: &Cli) -> GetWait {
 
 /// Build the `MQOO_*` access flags for consumer mode.
 ///
-/// `MQOO_INQUIRE` is always included: the get buffer is sized from the object's
-/// maximum message length, which can only be read when inquiry is permitted.
-fn consumer_access(cli: &Cli) -> mqi::types::MQOO {
+/// When `inquire` is set, `MQOO_INQUIRE` is added so the get buffer can be sized
+/// from the object's maximum message length. Callers fall back to `false` when
+/// the queue manager refuses an inquiring open.
+fn consumer_access(cli: &Cli, inquire: bool) -> mqi::types::MQOO {
     let base = if cli.browse {
         constants::MQOO_BROWSE | constants::MQOO_INPUT_AS_Q_DEF
     } else if cli.shared {
@@ -218,7 +238,20 @@ fn consumer_access(cli: &Cli) -> mqi::types::MQOO {
     } else {
         constants::MQOO_INPUT_AS_Q_DEF
     };
-    connection::access_options(base | constants::MQOO_INQUIRE)
+    let access = if inquire { base | constants::MQOO_INQUIRE } else { base };
+    connection::access_options(access)
+}
+
+/// Open the target for input, requesting inquiry authority.
+///
+/// The connection is borrowed rather than consumed so the caller can retry the
+/// open without reconnecting when this attempt is refused.
+fn open_with_inquire<'a>(
+    cli: &Cli,
+    target: &'a Target,
+    connection: connection::ConnectionRef<'a>,
+) -> Result<mqi::Object<connection::ConnectionRef<'a>>, mqi::result::Error> {
+    mqi::Object::open(connection, &connection::open_options(target, consumer_access(cli, true))).warn_as_error()
 }
 
 /// Collect message properties as a `name=value` CSV string.
@@ -345,13 +378,13 @@ mod tests {
     #[test]
     fn browse_uses_browse_access() {
         let cli = parse(&["-C", "-t", "Q1", "--browse"]);
-        assert!(consumer_access(&cli).contains(constants::MQOO_BROWSE));
+        assert!(consumer_access(&cli, true).contains(constants::MQOO_BROWSE));
     }
 
     #[test]
-    fn consumer_access_permits_inquiry_for_buffer_sizing() {
-        // The get buffer is sized from the object's MAXMSGL, which is only
-        // readable when inquiry is allowed on the open handle.
+    fn inquire_access_is_requested_when_available() {
+        // The preferred open asks for inquiry so the buffer can be sized from
+        // the object's MAXMSGL.
         for args in [
             &["-C", "-t", "Q1"][..],
             &["-C", "-t", "Q1", "--browse"][..],
@@ -359,10 +392,39 @@ mod tests {
         ] {
             let cli = parse(args);
             assert!(
-                consumer_access(&cli).contains(constants::MQOO_INQUIRE),
-                "inquiry must be permitted for {args:?}"
+                consumer_access(&cli, true).contains(constants::MQOO_INQUIRE),
+                "inquiry must be requested for {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn fallback_access_omits_inquire() {
+        // The retry must not ask for inquiry, or it would fail the same way.
+        for args in [
+            &["-C", "-t", "Q1"][..],
+            &["-C", "-t", "Q1", "--browse"][..],
+            &["-C", "-t", "Q1", "--shared"][..],
+        ] {
+            let cli = parse(args);
+            assert!(
+                !consumer_access(&cli, false).contains(constants::MQOO_INQUIRE),
+                "fallback must not request inquiry for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_access_keeps_input_intent() {
+        let cli = parse(&["-C", "-t", "Q1"]);
+        let access = consumer_access(&cli, false);
+        assert!(access.contains(constants::MQOO_INPUT_AS_Q_DEF));
+        assert!(!access.contains(constants::MQOO_INQUIRE));
+    }
+
+    #[test]
+    fn default_buffer_size_is_one_mebibyte() {
+        assert_eq!(DEFAULT_BUFFER_SIZE, 1024 * 1024);
     }
 
     #[test]
@@ -380,7 +442,7 @@ mod tests {
     #[test]
     fn shared_uses_shared_access() {
         let cli = parse(&["-C", "-t", "Q1", "--shared"]);
-        assert!(consumer_access(&cli).contains(constants::MQOO_INPUT_SHARED));
+        assert!(consumer_access(&cli, true).contains(constants::MQOO_INPUT_SHARED));
     }
 
     #[test]
