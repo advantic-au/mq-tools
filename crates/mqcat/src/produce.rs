@@ -252,16 +252,39 @@ fn parse_properties(cli: &Cli) -> Result<Vec<(&str, String)>, MqCatError> {
 
 /// Parse the message format name, defaulting to MQ string format.
 ///
+/// MQ format names are eight characters, space padded (`MQSTR   `). Users
+/// normally know the C constant name (`MQFMT_STRING`), so that spelling is
+/// accepted and translated. A bare name is padded to eight characters.
+///
 /// # Errors
 /// Returns an error when the supplied format name does not fit MQ's format field.
 fn parse_message_format(cli: &Cli) -> Result<MessageFormat, MqCatError> {
-    match cli.message_format.as_deref() {
-        Some(name) => name.parse::<MessageFormat>().map_err(|source| MqCatError::InvalidFormatName {
+    let Some(name) = cli.message_format.as_deref() else {
+        return Ok(MessageFormat::from(mqi::MqStr::from(mqi::header::fmt::MQFMT_STRING)));
+    };
+
+    let upper = name.to_ascii_uppercase();
+    let short = match upper.as_str() {
+        "MQFMT_STRING" => "MQSTR",
+        "MQFMT_NONE" => "MQNONE",
+        "MQFMT_TRIGGER" => "MQTRIG",
+        "MQFMT_WORK_INFO_HEADER" => "MQHWIH",
+        "MQFMT_DEAD_LETTER_HEADER" => "MQDEAD",
+        "MQFMT_TRANSMISSION_HEADER" => "MQXMIT",
+        "MQFMT_IMS_VAR_STRING" => "MQIMSVS",
+        "MQFMT_IMS" => "MQIMS",
+        "MQFMT_CICS" => "MQCICS",
+        other => other,
+    };
+
+    // MQ compares the full eight-character field, so pad with spaces.
+    let padded = format!("{short:<8}");
+    padded
+        .parse::<MessageFormat>()
+        .map_err(|source| MqCatError::InvalidFormatName {
             name: name.to_owned(),
             source,
-        }),
-        None => Ok(MessageFormat::from(mqi::MqStr::from(mqi::header::fmt::MQFMT_STRING))),
-    }
+        })
 }
 
 /// Parse the expiry argument as a millisecond count, or unlimited.
@@ -338,6 +361,7 @@ impl<'a, R: io::Read + 'a> DelimitedReader<'a, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser as _;
 
     #[test]
     fn splits_key_from_body() {
@@ -386,6 +410,29 @@ mod tests {
         let correl = correl_id_from_key(b"abc").unwrap();
         assert_eq!(&correl.0[..3], b"abc");
         assert_eq!(&correl.0[3..], &[0u8; 21]);
+    }
+
+    #[test]
+    fn message_format_accepts_c_constant_name() {
+        // Users pass the C constant name, but MQ compares the padded eight
+        // character field, so the long spelling must be translated.
+        let cli = Cli::try_parse_from(["mqcat", "-P", "-t", "Q1", "--message-format", "MQFMT_STRING"]).unwrap();
+        let format = parse_message_format(&cli).unwrap();
+        assert_eq!(&format.fmt.as_ref().map(|b| b as u8), b"MQSTR   ");
+    }
+
+    #[test]
+    fn message_format_pads_short_name() {
+        let cli = Cli::try_parse_from(["mqcat", "-P", "-t", "Q1", "--message-format", "MQSTR"]).unwrap();
+        let format = parse_message_format(&cli).unwrap();
+        assert_eq!(&format.fmt.as_ref().map(|b| b as u8), b"MQSTR   ");
+    }
+
+    #[test]
+    fn message_format_defaults_to_string() {
+        let cli = Cli::try_parse_from(["mqcat", "-P", "-t", "Q1"]).unwrap();
+        let format = parse_message_format(&cli).unwrap();
+        assert_eq!(&format.fmt.as_ref().map(|b| b as u8), b"MQSTR   ");
     }
 
     #[test]

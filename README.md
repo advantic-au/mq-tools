@@ -44,21 +44,49 @@ client at load time, which you can confirm with `ldd target/release/mqcat`.
 
 ## Run
 
+The examples below use the IBM MQ container's default developer
+configuration: queue manager `QM1`, queue `DEV.QUEUE.1`, channel
+`DEV.APP.SVRCONN`, and the `app` user.
+
 ```bash
-# Consume from a queue on a client connection
-mqcat -C -t DEV.QUEUE.1 \
-      -b DEV.APP.SVRCONN/TCP/localhost\(1414\) \
-      -m QM1 -u app -a passw0rd
+export MQ_SERVER='DEV.APP.SVRCONN/TCP/localhost(1414)'
 
 # Produce the contents of a file as one message
-mqcat -P -t DEV.QUEUE.1 -b DEV.APP.SVRCONN/TCP/localhost\(1414\) -m QM1 message.json
+mqcat -P -t DEV.QUEUE.1 -b "$MQ_SERVER" -m QM1 -u app -a password message.json
 
 # Produce stdin split on newlines
-printf 'one\ntwo\n' | mqcat -P -t DEV.QUEUE.1 -b DEV.APP.SVRCONN/TCP/localhost\(1414\) -m QM1
+printf 'one\ntwo\n' | mqcat -P -t DEV.QUEUE.1 -b "$MQ_SERVER" -m QM1 -u app -a password
+
+# Consume and print each body
+mqcat -C -t DEV.QUEUE.1 -b "$MQ_SERVER" -m QM1 -u app -a password -c 2
+
+# Browse without removing anything from the queue
+mqcat -C --browse -t DEV.QUEUE.1 -b "$MQ_SERVER" -m QM1 -u app -a password
 
 # Inspect queue depth
-mqcat -L -t DEV.QUEUE.1 -b DEV.APP.SVRCONN/TCP/localhost\(1414\) -m QM1
+mqcat -L -t DEV.QUEUE.1 -b "$MQ_SERVER" -m QM1 -u app -a password
 ```
+
+### Queue manager prerequisites
+
+`mqcat` needs no special queue manager configuration beyond a working channel
+and a user that may connect. Two settings are worth knowing about:
+
+* **`MQOO_INQUIRE` is required.** The consumer sizes its get buffer from the
+  queue's `MAXMSGL`, so the user needs inquire authority on the queue. Without
+  it, MQGET fails with `MQRC_DATA_LENGTH_ERROR`.
+* **Connection authentication.** If the queue manager uses `CONNAUTH` with
+  `CHCKCLNT(REQUIRED)`, the supplied user and password are validated by the
+  host's PAM stack. Minimal container images often ship without PAM modules or
+  an `app` OS user, in which case authentication cannot succeed and the
+  connection is refused with `MQRC_NOT_AUTHORIZED` or `MQRC_SECURITY_ERROR`.
+  Either install PAM and create the user, or relax the check for development:
+
+  ```bash
+  # Development only: accept the supplied user without validating the password
+  echo "ALTER AUTHINFO(DEV.AUTHINFO) AUTHTYPE(IDPWOS) CHCKCLNT(NONE) ADOPTCTX(YES)" | runmqsc QM1
+  echo "SET CHLAUTH(DEV.APP.SVRCONN) TYPE(ADDRESSMAP) ADDRESS(*) USERSRC(CHANNEL) CHCKCLNT(ASQMGR) ACTION(REPLACE)" | runmqsc QM1
+  ```
 
 See [`crates/mqcat/README.md`](crates/mqcat/README.md) for the full option
 reference and the format-string tokens.

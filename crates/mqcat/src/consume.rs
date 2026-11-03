@@ -66,7 +66,18 @@ pub fn run(cli: &Cli, target: &Target) -> Result<(), MqCatError> {
             source,
         })?;
 
-    let mut buffer = vec![0u8; 16 * 1024 * 1024];
+    // MQ rejects an MQGET whose buffer length exceeds the object's maximum
+    // message length with MQRC_DATA_LENGTH_ERROR, so size the buffer from the
+    // queue's own limit instead of guessing. Topics report no limit, so fall
+    // back to a generous default there.
+    let max_message_length = object
+        .inquire_integer(mqi::attribute::MQIA_MAX_MSG_LENGTH)
+        .warn_as_error()
+        .ok()
+        .flatten()
+        .filter(|len| *len > 0)
+        .map_or(16 * 1024 * 1024, |len| len as usize);
+    let mut buffer = vec![0u8; max_message_length];
     let mut stdout = io::stdout().lock();
     let mut consumed = 0usize;
 
@@ -91,13 +102,22 @@ pub fn run(cli: &Cli, target: &Target) -> Result<(), MqCatError> {
         // When syncpoint is requested the get joins the unit of work and the
         // message is only removed once committed below.
         let syncpoint = cli.syncpoint.then_some(constants::MQGMO_SYNCPOINT);
+        // Browsing needs a browse cursor on the get, not just MQOO_BROWSE on the
+        // open: without these options MQGET removes the message even though the
+        // handle was opened for browsing. The first get positions the cursor and
+        // later gets advance it.
+        let browse = cli.browse.then_some(if consumed == 0 {
+            constants::MQGMO_BROWSE_FIRST
+        } else {
+            constants::MQGMO_BROWSE_NEXT
+        });
 
         let result = match properties.as_mut() {
             Some(handle) => object
-                .get_data_with(&(wait, correl, msg, syncpoint, &mut *handle), buffer.as_mut_slice())
+                .get_data_with(&(wait, correl, msg, syncpoint, browse, &mut *handle), buffer.as_mut_slice())
                 .warn_as_error(),
             None => object
-                .get_data_with(&(wait_option(cli), correl, msg, syncpoint), buffer.as_mut_slice())
+                .get_data_with(&(wait_option(cli), correl, msg, syncpoint, browse), buffer.as_mut_slice())
                 .warn_as_error(),
         };
 
@@ -187,6 +207,9 @@ fn wait_option(cli: &Cli) -> GetWait {
 }
 
 /// Build the `MQOO_*` access flags for consumer mode.
+///
+/// `MQOO_INQUIRE` is always included: the get buffer is sized from the object's
+/// maximum message length, which can only be read when inquiry is permitted.
 fn consumer_access(cli: &Cli) -> mqi::types::MQOO {
     let base = if cli.browse {
         constants::MQOO_BROWSE | constants::MQOO_INPUT_AS_Q_DEF
@@ -195,7 +218,7 @@ fn consumer_access(cli: &Cli) -> mqi::types::MQOO {
     } else {
         constants::MQOO_INPUT_AS_Q_DEF
     };
-    connection::access_options(base)
+    connection::access_options(base | constants::MQOO_INQUIRE)
 }
 
 /// Collect message properties as a `name=value` CSV string.
@@ -208,9 +231,31 @@ fn collect_properties(handle: &mqi::Properties<connection::ConnectionRef<'_>>) -
             operation: "MQINQMP",
             source,
         })?;
-        pairs.push(format!("{name}={value:?}"));
+        pairs.push(format!("{name}={}", property_value_text(&value)));
     }
     Ok(pairs.join(","))
+}
+
+/// Render a property value as text for the `%h` format token.
+///
+/// `mqi`'s `Value` has no `Display` implementation, so each variant is rendered
+/// here. String values are decoded from their CCSID; anything that cannot be
+/// decoded falls back to a lossy rendering rather than failing the whole message.
+fn property_value_text(value: &mqi::properties::Value) -> String {
+    use mqi::properties::Value;
+
+    match value {
+        Value::Boolean(flag) => flag.to_string(),
+        Value::Int8(number) => number.to_string(),
+        Value::Int16(number) => number.to_string(),
+        Value::Int32(number) => number.to_string(),
+        Value::Int64(number) => number.to_string(),
+        Value::Float32(number) => number.to_string(),
+        Value::Float64(number) => number.to_string(),
+        Value::ByteString(bytes) => bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+        Value::String(text) => String::try_from(text.clone()).unwrap_or_else(|_| "<non-utf8>".to_owned()),
+        Value::Null => String::new(),
+    }
 }
 
 /// Write the rendered message followed by the output delimiter.
@@ -301,6 +346,35 @@ mod tests {
     fn browse_uses_browse_access() {
         let cli = parse(&["-C", "-t", "Q1", "--browse"]);
         assert!(consumer_access(&cli).contains(constants::MQOO_BROWSE));
+    }
+
+    #[test]
+    fn consumer_access_permits_inquiry_for_buffer_sizing() {
+        // The get buffer is sized from the object's MAXMSGL, which is only
+        // readable when inquiry is allowed on the open handle.
+        for args in [
+            &["-C", "-t", "Q1"][..],
+            &["-C", "-t", "Q1", "--browse"][..],
+            &["-C", "-t", "Q1", "--shared"][..],
+        ] {
+            let cli = parse(args);
+            assert!(
+                consumer_access(&cli).contains(constants::MQOO_INQUIRE),
+                "inquiry must be permitted for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn property_values_render_as_plain_text() {
+        use mqi::properties::Value;
+
+        assert_eq!(property_value_text(&Value::Int32(42)), "42");
+        assert_eq!(property_value_text(&Value::Boolean(true)), "true");
+        assert_eq!(property_value_text(&Value::ByteString(vec![0xab, 0x01])), "ab01");
+        assert_eq!(property_value_text(&Value::Null), "");
+        let text: mqi::string::StrCcsidOwned = "hello".into();
+        assert_eq!(property_value_text(&Value::String(text)), "hello");
     }
 
     #[test]
