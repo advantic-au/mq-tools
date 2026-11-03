@@ -13,6 +13,12 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 dlopen2.workspace = true
+encoding_rs.workspace = true
 libmqm-sys.workspace = true
 mqi.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Reads the active console input code page. The FFI crate is already present
+# through dlopen2; only the Console feature is added.
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

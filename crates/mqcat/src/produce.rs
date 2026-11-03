@@ -1,15 +1,91 @@
 //! Producer mode: read input and put messages on the target.
 
-use std::io::{self, Write as _};
+use std::borrow::Cow;
+use std::io::{self, IsTerminal as _, Write as _};
 
-use mqi::{constants, prelude::*, types::MessageFormat};
+use mqi::{constants, prelude::*, string::CCSID, types::MessageFormat};
 
 use crate::{
     cli::{Cli, Persistence},
     connection::{self, Connection},
     error::MqCatError,
+    locale,
     target::Target,
 };
+
+/// CCSID for UTF-8, used when transcoding terminal input.
+const CCSID_UTF8: i32 = 1208;
+
+/// How input bytes are interpreted before being put on the queue.
+#[derive(Debug, Clone, Copy)]
+enum InputEncoding {
+    /// Send the bytes unchanged and leave the CCSID to the queue manager.
+    ///
+    /// Used for piped input and files, which are byte-exact payloads.
+    None,
+    /// Decode the bytes to UTF-8 and declare CCSID 1208.
+    Utf8(&'static encoding_rs::Encoding),
+    /// Send the bytes unchanged and declare this OEM CCSID.
+    ///
+    /// IBM MQ converts these code pages itself, so transcoding would lose the
+    /// information that the payload is OEM text.
+    Oem(i32),
+}
+
+/// Decide how to interpret terminal input.
+///
+/// Encoding detection only applies to an interactive stdin: piped input and
+/// files are byte-exact payloads and must not be altered. An explicit `--ccsid`
+/// also disables detection, because the user has stated how to interpret the
+/// bytes.
+fn resolve_input_encoding(cli: &Cli, interactive: bool) -> InputEncoding {
+    if cli.ccsid.is_some() || !interactive {
+        return InputEncoding::None;
+    }
+
+    if let Some(ccsid) = locale::console_code_page().and_then(locale::oem_ccsid_for_code_page) {
+        return InputEncoding::Oem(ccsid);
+    }
+
+    match locale::terminal_encoding() {
+        Some(encoding) if !locale::is_utf8(encoding) => InputEncoding::Utf8(encoding),
+        _ => InputEncoding::None,
+    }
+}
+
+/// Apply the resolved CCSID to the message format, leaving the rest untouched.
+fn apply_ccsid(cli: &Cli, message_format: MessageFormat, input_encoding: InputEncoding) -> MessageFormat {
+    let ccsid = match (cli.ccsid, input_encoding) {
+        (Some(ccsid), _) => ccsid,
+        (None, InputEncoding::Oem(ccsid)) => ccsid,
+        (None, InputEncoding::Utf8(_)) => CCSID_UTF8,
+        (None, InputEncoding::None) => return message_format,
+    };
+    MessageFormat {
+        ccsid: CCSID(ccsid),
+        ..message_format
+    }
+}
+
+/// Convert the message body to the encoding the CCSID describes.
+///
+/// OEM and unaltered input pass through unchanged. Input declared as an ANSI or
+/// CJK encoding is decoded to UTF-8. Invalid input is rejected rather than
+/// substituted, because silently replacing bytes would corrupt the message.
+fn encode_body<'a>(body: &'a [u8], input_encoding: InputEncoding) -> Result<Cow<'a, [u8]>, MqCatError> {
+    match input_encoding {
+        InputEncoding::None | InputEncoding::Oem(_) => Ok(Cow::Borrowed(body)),
+        InputEncoding::Utf8(encoding) => match encoding.decode_without_bom_handling_and_without_replacement(body) {
+            // A borrowed result means the input was already valid UTF-8, so the
+            // original bytes are already correct and no copy is needed.
+            Some(Cow::Borrowed(_)) => Ok(Cow::Borrowed(body)),
+            Some(Cow::Owned(text)) => Ok(Cow::Owned(text.into_bytes())),
+            None => Err(MqCatError::Transcode {
+                encoding: encoding.name(),
+            }),
+        },
+    }
+}
 
 /// Run producer mode.
 ///
@@ -43,6 +119,12 @@ pub fn run(cli: &Cli, target: &Target) -> Result<(), MqCatError> {
     let message_format = parse_message_format(cli)?;
     let access = connection::access_options(constants::MQOO_OUTPUT);
 
+    // Files are complete, byte-exact payloads, so encoding detection applies
+    // only when messages are being read from an interactive stdin.
+    let interactive = cli.files.is_empty() && io::stdin().is_terminal();
+    let input_encoding = resolve_input_encoding(cli, interactive);
+    let message_format = apply_ccsid(cli, message_format, input_encoding);
+
     let connection = connection::connect(cli)?;
     let object = mqi::Object::open(connection, &connection::open_options(target, access))
         .warn_as_error()
@@ -61,7 +143,15 @@ pub fn run(cli: &Cli, target: &Target) -> Result<(), MqCatError> {
             if message.is_empty() {
                 continue;
             }
-            put(&object, cli, message, key_delimiter.as_deref(), &properties, message_format)?;
+            put(
+                &object,
+                cli,
+                message,
+                key_delimiter.as_deref(),
+                &properties,
+                message_format,
+                input_encoding,
+            )?;
             produced += 1;
             if reached_limit(cli, produced) {
                 return Ok(());
@@ -76,7 +166,15 @@ pub fn run(cli: &Cli, target: &Target) -> Result<(), MqCatError> {
             if bytes.is_empty() {
                 continue;
             }
-            put(&object, cli, &bytes, key_delimiter.as_deref(), &properties, message_format)?;
+            put(
+                &object,
+                cli,
+                &bytes,
+                key_delimiter.as_deref(),
+                &properties,
+                message_format,
+                input_encoding,
+            )?;
             produced += 1;
             if reached_limit(cli, produced) {
                 return Ok(());
@@ -128,8 +226,14 @@ fn put(
     key_delimiter: Option<&[u8]>,
     properties: &[(&str, String)],
     message_format: MessageFormat,
+    input_encoding: InputEncoding,
 ) -> Result<(), MqCatError> {
     let (key, body) = split_key(message, key_delimiter);
+
+    // Terminal input in a legacy encoding is converted to the character set the
+    // message CCSID declares; OEM input stays byte-exact for MQ to convert.
+    let encoded_body = encode_body(body, input_encoding)?;
+    let body: &[u8] = encoded_body.as_ref();
 
     // kcat treats the message key as the field that correlates related messages.
     // The closest MQ equivalent is the correlation identifier, so a key present in
@@ -200,8 +304,12 @@ fn put(
     }
 
     if cli.tee {
+        // Echo the input as it was read: the key prefix and body are both part
+        // of what the user piped in, so tee must not print the body alone. The
+        // bytes are written before any character-set conversion so the echo is
+        // byte-exact with the input stream.
         let mut stdout = io::stdout().lock();
-        stdout.write_all(body).map_err(MqCatError::Write)?;
+        stdout.write_all(message).map_err(MqCatError::Write)?;
         stdout.write_all(&delimiter_bytes(cli)).map_err(MqCatError::Write)?;
         stdout.flush().map_err(MqCatError::Write)?;
     }
@@ -406,6 +514,19 @@ mod tests {
     }
 
     #[test]
+    fn tee_echoes_key_prefix_with_body() {
+        // `-T` echoes the input stream, so a key prefix must appear in the echo
+        // even though only the body after the key delimiter is sent as a message.
+        let cli = Cli::try_parse_from(["mqcat", "-P", "-t", "Q1", "-K", "|", "-T"]).unwrap();
+        let key_delimiter = crate::delimiters::parse(cli.key_delimiter.as_deref().unwrap()).unwrap();
+        let message = b"alpha|beta";
+        let (key, body) = split_key(message, Some(&key_delimiter));
+        assert_eq!(key, Some(&b"alpha"[..]));
+        assert_eq!(body, b"beta");
+        assert_eq!(message, b"alpha|beta");
+    }
+
+    #[test]
     fn key_becomes_correlation_identifier() {
         let correl = correl_id_from_key(b"abc").unwrap();
         assert_eq!(&correl.0[..3], b"abc");
@@ -452,5 +573,91 @@ mod tests {
         assert_eq!(find_subslice(b"abcdef", b"cd"), Some(2));
         assert_eq!(find_subslice(b"abcdef", b"zz"), None);
         assert_eq!(find_subslice(b"abc", b""), None);
+    }
+
+    /// Build a message format whose CCSID is the only field under test.
+    fn message_format_with_ccsid(ccsid: CCSID) -> MessageFormat {
+        let mut format = MessageFormat::from(mqi::MqStr::from(mqi::header::fmt::MQFMT_STRING));
+        format.ccsid = ccsid;
+        format
+    }
+
+    #[test]
+    fn explicit_ccsid_disables_detection() {
+        // The user has stated how to interpret the bytes, so the terminal's
+        // encoding must not override that choice.
+        let cli = Cli::try_parse_from(["mqcat", "-P", "-t", "Q1", "--ccsid", "819"]).unwrap();
+        assert!(matches!(resolve_input_encoding(&cli, true), InputEncoding::None));
+    }
+
+    #[test]
+    fn non_interactive_input_is_never_converted() {
+        // Piped input and files are byte-exact payloads.
+        let cli = Cli::try_parse_from(["mqcat", "-P", "-t", "Q1"]).unwrap();
+        assert!(matches!(resolve_input_encoding(&cli, false), InputEncoding::None));
+    }
+
+    #[test]
+    fn explicit_ccsid_is_declared_without_conversion() {
+        let cli = Cli::try_parse_from(["mqcat", "-P", "-t", "Q1", "--ccsid", "819"]).unwrap();
+        let format = message_format_with_ccsid(CCSID(0));
+        let applied = apply_ccsid(&cli, format, InputEncoding::None);
+        assert_eq!(applied.ccsid, CCSID(819));
+    }
+
+    #[test]
+    fn utf8_detection_declares_utf8_ccsid() {
+        let cli = Cli::try_parse_from(["mqcat", "-P", "-t", "Q1"]).unwrap();
+        let format = message_format_with_ccsid(CCSID(0));
+        let applied = apply_ccsid(&cli, format, InputEncoding::Utf8(encoding_rs::WINDOWS_1252));
+        assert_eq!(applied.ccsid, CCSID(CCSID_UTF8));
+    }
+
+    #[test]
+    fn oem_detection_declares_oem_ccsid() {
+        let cli = Cli::try_parse_from(["mqcat", "-P", "-t", "Q1"]).unwrap();
+        let format = message_format_with_ccsid(CCSID(0));
+        let applied = apply_ccsid(&cli, format, InputEncoding::Oem(437));
+        assert_eq!(applied.ccsid, CCSID(437));
+    }
+
+    #[test]
+    fn detection_leaves_format_untouched_when_undetermined() {
+        let cli = Cli::try_parse_from(["mqcat", "-P", "-t", "Q1"]).unwrap();
+        let format = message_format_with_ccsid(CCSID(0));
+        let applied = apply_ccsid(&cli, format, InputEncoding::None);
+        assert_eq!(applied.ccsid, CCSID(0));
+    }
+
+    #[test]
+    fn legacy_input_is_converted_to_utf8() {
+        // 0xE9 is `é` in windows-1252 but invalid standalone UTF-8.
+        let encoded = encode_body(&[b'c', b'a', b'f', 0xE9], InputEncoding::Utf8(encoding_rs::WINDOWS_1252)).unwrap();
+        assert_eq!(encoded.as_ref(), "caf\u{e9}".as_bytes());
+    }
+
+    #[test]
+    fn already_utf8_input_is_not_copied() {
+        let input = b"plain ascii";
+        let encoded = encode_body(input, InputEncoding::Utf8(encoding_rs::WINDOWS_1252)).unwrap();
+        assert!(matches!(encoded, Cow::Borrowed(_)));
+        assert_eq!(encoded.as_ref(), input);
+    }
+
+    #[test]
+    fn invalid_input_for_the_encoding_is_rejected() {
+        // 0x82 is a lead byte with no trail byte in Shift_JIS. A lossy conversion
+        // would insert a replacement character, so rejecting keeps the message
+        // uncorrupted.
+        let error = encode_body(&[0x82], InputEncoding::Utf8(encoding_rs::SHIFT_JIS)).unwrap_err();
+        assert!(matches!(error, MqCatError::Transcode { .. }));
+    }
+
+    #[test]
+    fn oem_input_passes_through_unchanged() {
+        // IBM MQ converts OEM code pages itself when the CCSID says so.
+        let input = [0x82, 0xA7];
+        let encoded = encode_body(&input, InputEncoding::Oem(437)).unwrap();
+        assert_eq!(encoded.as_ref(), input);
     }
 }

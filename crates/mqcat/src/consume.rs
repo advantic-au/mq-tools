@@ -66,33 +66,44 @@ pub fn run(cli: &Cli, target: &Target) -> Result<(), MqCatError> {
 
     let connection = connection::connect(cli)?;
 
-    // Prefer an open that permits inquiry: the get buffer is then sized from the
-    // queue's own maximum message length, which avoids both truncation and the
-    // MQRC_DATA_LENGTH_ERROR MQ returns when the buffer exceeds that limit.
-    // Inquire authority is not always granted, so fall back to a plain input
-    // open and a fixed default buffer when the first attempt is refused.
-    let (object, max_message_length) = match open_with_inquire(cli, target, connection.connection_ref()) {
-        Ok(object) => {
-            let limit = object
-                .inquire_integer(mqi::attribute::MQIA_MAX_MSG_LENGTH)
+    // A topic cannot be opened for input directly: MQ rejects a get handle on a
+    // topic with MQRC_OPTIONS_ERROR. Consuming from a topic therefore creates a
+    // managed, non-durable subscription and reads from the queue MQ allocates
+    // for it. A queue is opened for input as usual.
+    let (object, subscription, max_message_length) = if target.is_topic() {
+        let (subscription, object) = open_subscription(target, connection.connection_ref())?;
+        // A managed subscription queue is temporary and cannot be inquired for
+        // MAXMSGL reliably, so the fixed default is used.
+        (object, Some(subscription), DEFAULT_BUFFER_SIZE)
+    } else {
+        // Prefer an open that permits inquiry: the get buffer is then sized from
+        // the queue's own maximum message length, which avoids both truncation and
+        // the MQRC_DATA_LENGTH_ERROR MQ returns when the buffer exceeds that limit.
+        // Inquire authority is not always granted, so fall back to a plain input
+        // open and a fixed default buffer when the first attempt is refused.
+        match open_with_inquire(cli, target, connection.connection_ref()) {
+            Ok(object) => {
+                let limit = object
+                    .inquire_integer(mqi::attribute::MQIA_MAX_MSG_LENGTH)
+                    .warn_as_error()
+                    .ok()
+                    .flatten()
+                    .filter(|len| *len > 0)
+                    .map_or(DEFAULT_BUFFER_SIZE, |len| len as usize);
+                (object, None, limit)
+            }
+            Err(_) => {
+                let object = mqi::Object::open(
+                    connection.connection_ref(),
+                    &connection::open_options(target, consumer_access(cli, false)),
+                )
                 .warn_as_error()
-                .ok()
-                .flatten()
-                .filter(|len| *len > 0)
-                .map_or(DEFAULT_BUFFER_SIZE, |len| len as usize);
-            (object, limit)
-        }
-        Err(_) => {
-            let object = mqi::Object::open(
-                connection.connection_ref(),
-                &connection::open_options(target, consumer_access(cli, false)),
-            )
-            .warn_as_error()
-            .map_err(|source| MqCatError::Open {
-                target: target.display_name(),
-                source,
-            })?;
-            (object, DEFAULT_BUFFER_SIZE)
+                .map_err(|source| MqCatError::Open {
+                    target: target.display_name(),
+                    source,
+                })?;
+                (object, None, DEFAULT_BUFFER_SIZE)
+            }
         }
     };
 
@@ -203,7 +214,55 @@ pub fn run(cli: &Cli, target: &Target) -> Result<(), MqCatError> {
         source,
     })?;
 
+    // Closing the subscription removes the managed queue and the subscription
+    // itself. It is closed after the queue handle so the queue is still valid
+    // while the object handle closes.
+    if let Some(subscription) = subscription {
+        subscription.close().warn_as_error().map_err(|source| MqCatError::Mq {
+            operation: "MQCLOSE",
+            source,
+        })?;
+    }
+
     Ok(())
+}
+
+/// Create a managed, non-durable subscription and return the queue to read from.
+///
+/// A topic cannot be opened for input: MQ requires an `MQSUB` to create the
+/// subscription that resolves the topic to a queue. `MQSO_MANAGED` asks MQ to
+/// allocate and open that queue, and `MQSO_NON_DURABLE` keeps the subscription
+/// alive only while the process is running, which matches kcat's behaviour of
+/// consuming what is published while it is subscribed.
+///
+/// # Errors
+/// Returns an error when the subscription cannot be created.
+fn open_subscription<'a>(
+    target: &'a Target,
+    connection: connection::ConnectionRef<'a>,
+) -> Result<
+    (
+        mqi::Subscription<connection::ConnectionRef<'a>>,
+        mqi::Object<connection::ConnectionRef<'a>>,
+    ),
+    MqCatError,
+> {
+    let Target::Topic { name } = target else {
+        return Err(MqCatError::InvalidOption("a subscription requires a topic target"));
+    };
+
+    // A managed subscription's queue is opened by MQ with input access. Only
+    // `MQSO_*` options apply to the subscription; `MQOO_*` access flags belong to
+    // the object open and would be rejected here. `MQSO_MANAGED` must not be
+    // repeated: `subscribe_managed` already sets it, and MQ rejects the
+    // duplicate flag with MQRC_OPTIONS_ERROR.
+    let options = constants::MQSO_CREATE | constants::MQSO_NON_DURABLE;
+    mqi::Subscription::subscribe_managed(connection, (options, mqi::open::ObjectString(name.as_str())))
+        .warn_as_error()
+        .map_err(|source| MqCatError::Open {
+            target: target.display_name(),
+            source,
+        })
 }
 
 /// Compile the format string, falling back to the default.

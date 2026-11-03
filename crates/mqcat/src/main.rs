@@ -12,6 +12,7 @@ mod consume;
 mod delimiters;
 mod error;
 mod format;
+mod locale;
 mod produce;
 mod target;
 

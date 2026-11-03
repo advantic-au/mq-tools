@@ -88,6 +88,13 @@ pub enum MqCatError {
     #[error("invalid property `{0}`: expected `name=value`")]
     InvalidProperty(String),
 
+    /// Terminal input could not be decoded from the encoding in use.
+    #[error("input is not valid {encoding}")]
+    Transcode {
+        /// Name of the encoding the input was declared to use.
+        encoding: &'static str,
+    },
+
     /// The format string could not be interpreted.
     #[error("invalid format string")]
     InvalidFormat {
@@ -163,7 +170,8 @@ impl MqCatError {
             | Self::Mq { .. }
             | Self::Read(_)
             | Self::Write(_)
-            | Self::ReadFile { .. } => ExitCode::FAILURE,
+            | Self::ReadFile { .. }
+            | Self::Transcode { .. } => ExitCode::FAILURE,
         }
     }
 }

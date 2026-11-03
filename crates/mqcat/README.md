@@ -139,10 +139,29 @@ Exactly one mode applies. With no mode flag, consumer mode is used.
 | `--persistence <yes\|no\|as-queue-default>` | Message persistence |
 | `--expiry <unlimited\|MILLIS>` | Message expiry |
 | `--message-format <FORMAT>` | MQ format name, for example `MQFMT_STRING` |
+| `--ccsid <CCSID>` | CCSID to declare for produced messages; disables encoding detection |
 | `--reply-to <QUEUE>` | Reply-to queue |
 | `-H`, `--property <NAME=VALUE>` | Set a message property; repeatable |
-| `-T`, `--tee` | Print produced bodies to stdout as well as putting them |
+| `-T`, `--tee` | Echo each input record to stdout as well as putting it |
 | `FILE...` | Files to send as whole messages |
+
+### Character encoding of produced messages
+
+Input typed at an interactive terminal is in whatever encoding the console uses,
+which is not necessarily UTF-8. `mqcat` detects that encoding and handles it two
+ways, so the queue manager and consumers see correctly decoded text:
+
+| Host encoding | Action |
+|---|---|
+| UTF-8 | Bytes sent unchanged; CCSID is left to the queue manager |
+| ANSI/Windows and CJK pages (`encoding_rs` supported) | Decoded to UTF-8; message declared CCSID `1208` |
+| OEM/DOS code pages | Bytes sent unchanged; message declared the matching OEM CCSID for MQ to convert |
+
+Piped input and `FILE` arguments are never altered, because they are byte-exact
+payloads. `--ccsid` overrides detection entirely and declares the given CCSID
+without converting the bytes; use it when the input is already in a known
+character set. Invalid input for a detected encoding is rejected rather than
+substituted, so a message is never silently corrupted.
 
 ### Consuming
 
@@ -195,6 +214,10 @@ mqcat -P -t DEV.QUEUE.1 -b DEV.APP.SVRCONN/TCP/localhost\(1414\) -m QM1 \
 printf 'alpha|beta|gamma' | mqcat -P -t DEV.QUEUE.1 \
       -b DEV.APP.SVRCONN/TCP/localhost\(1414\) -m QM1 -D '|'
 
+# Declare the character set of input that is already in Latin-1
+mqcat -P -t DEV.QUEUE.1 -b DEV.APP.SVRCONN/TCP/localhost\(1414\) -m QM1 \
+      --ccsid 819 latin1.txt
+
 # Browse without removing, exiting as soon as the queue is drained
 mqcat -C -t DEV.QUEUE.1 -b DEV.APP.SVRCONN/TCP/localhost\(1414\) -m QM1 \
       --browse -e
@@ -205,10 +228,12 @@ mqcat -C -t DEV.QUEUE.1 -b DEV.APP.SVRCONN/TCP/localhost\(1414\) -m QM1 \
 * **No partitions or offsets.** MQ delivers messages in queue order and does not
   expose a numeric offset. The message identifier and correlation identifier are
   the identifying fields available.
-* **Consuming from topics.** Opening a topic string reads from the subscription MQ
-  resolves for the connection. Managed subscriptions are not created
-  automatically; use `mqi`'s `Subscription` API directly if you need durable or
-  managed subscriptions.
+* **Consuming from topics.** MQ rejects a get handle opened directly on a topic,
+  so consuming from a topic string creates a managed, non-durable subscription
+  and reads from the temporary queue MQ allocates for it. The subscription ends
+  when `mqcat` exits, so messages published while nothing is subscribed are not
+  retained. Use `mqi`'s `Subscription` API for durable subscriptions, which keep
+  messages across restarts.
 * **Key handling.** `-K` splits input into a key and a body. The key is written
   into the message's correlation identifier, which is how MQ applications
   correlate request and reply messages. A key longer than 24 bytes cannot be

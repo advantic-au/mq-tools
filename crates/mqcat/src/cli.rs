@@ -156,6 +156,15 @@ pub struct Cli {
     #[arg(long, value_name = "FORMAT")]
     pub message_format: Option<String>,
 
+    /// CCSID to declare for produced messages.
+    ///
+    /// Disables automatic terminal encoding detection and conversion: the
+    /// message bytes are sent unchanged and tagged with this CCSID so the queue
+    /// manager converts them. Piped input and files are never converted, so
+    /// this is only needed when the input is already in the given character set.
+    #[arg(long, value_name = "CCSID")]
+    pub ccsid: Option<i32>,
+
     /// Reply-to queue to set on produced messages.
     #[arg(long, value_name = "QUEUE")]
     pub reply_to: Option<String>,
@@ -230,6 +239,9 @@ impl Cli {
         }
         if self.mode() != Mode::Produce && self.tee {
             return Err(MqCatError::InvalidOption("--tee requires producer mode"));
+        }
+        if self.mode() != Mode::Produce && self.ccsid.is_some() {
+            return Err(MqCatError::InvalidOption("--ccsid requires producer mode"));
         }
         Ok(())
     }

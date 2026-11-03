@@ -23,3 +23,7 @@ clap = { version = "4.6", features = ["derive", "env"] }
 thiserror = "2"
 # Surfaces dynamic-loader failures when opening the MQ client library at run time.
 dlopen2 = "0.9"
+# Decodes terminal input from the host's ANSI/Windows code page into UTF-8. It
+# implements the WHATWG Encoding Standard, so OEM code pages are absent by
+# design; those are handled as MQ-native CCSIDs instead of being transcoded.
+encoding_rs = "0.8"

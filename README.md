@@ -49,22 +49,22 @@ configuration: queue manager `QM1`, queue `DEV.QUEUE.1`, channel
 `DEV.APP.SVRCONN`, and the `app` user.
 
 ```bash
-export MQ_SERVER='DEV.APP.SVRCONN/TCP/localhost(1414)'
+export MQSERVER='DEV.APP.SVRCONN/TCP/localhost(1414)'
 
 # Produce the contents of a file as one message
-mqcat -P -t DEV.QUEUE.1 -b "$MQ_SERVER" -m QM1 -u app -a password message.json
+mqcat -P -t DEV.QUEUE.1 -b "$MQSERVER" -m QM1 -u app -a password message.json
 
 # Produce stdin split on newlines
-printf 'one\ntwo\n' | mqcat -P -t DEV.QUEUE.1 -b "$MQ_SERVER" -m QM1 -u app -a password
+printf 'one\ntwo\n' | mqcat -P -t DEV.QUEUE.1 -b "$MQSERVER" -m QM1 -u app -a password
 
 # Consume and print each body
-mqcat -C -t DEV.QUEUE.1 -b "$MQ_SERVER" -m QM1 -u app -a password -c 2
+mqcat -C -t DEV.QUEUE.1 -b "$MQSERVER" -m QM1 -u app -a password -c 2
 
 # Browse without removing anything from the queue
-mqcat -C --browse -t DEV.QUEUE.1 -b "$MQ_SERVER" -m QM1 -u app -a password
+mqcat -C --browse -t DEV.QUEUE.1 -b "$MQSERVER" -m QM1 -u app -a password
 
 # Inspect queue depth
-mqcat -L -t DEV.QUEUE.1 -b "$MQ_SERVER" -m QM1 -u app -a password
+mqcat -L -t DEV.QUEUE.1 -b "$MQSERVER" -m QM1 -u app -a password
 ```
 
 See [`crates/mqcat/README.md`](crates/mqcat/README.md) for the full option
